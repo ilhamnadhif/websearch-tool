@@ -1,0 +1,4 @@
+/websearch-tool
+*.exe
+*.test
+.DS_Store
