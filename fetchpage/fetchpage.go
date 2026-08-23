@@ -1,7 +1,10 @@
 // Package fetchpage downloads a web page and extracts its title and main
 // text content. It only fetches http/https URLs and refuses to connect to
-// private, loopback, or link-local addresses. Use package websearch to find
-// candidate URLs to fetch.
+// private, loopback, or link-local addresses. The destination IP is
+// validated at dial time — including on every redirect hop, because
+// redirects reuse the same guarded Transport — so DNS rebinding cannot
+// bypass the check. Bodies are capped at maxBodyBytes. Use package
+// websearch to find candidate URLs to fetch.
 package fetchpage
 
 import (
@@ -25,6 +28,7 @@ const (
 	maxContentChars  = 4000
 	minReadableChars = 200
 	maxURLsPerCall   = 5
+	maxBodyBytes     = 5 << 20 // 5 MB; pages larger than this are rejected before parsing
 )
 
 var userAgent = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"
@@ -119,7 +123,13 @@ func FetchMany(ctx context.Context, urls []string) []Result {
 // tries readability-style extraction first (suited to articles and blog
 // posts) and falls back to a manual tag-stripping extraction when that
 // yields too little text, e.g. on product listing pages. Content is
-// truncated to 4000 characters. ctx controls cancellation and timeout.
+// truncated to 4000 characters. Bodies larger than maxBodyBytes are
+// rejected instead of being read into memory.
+//
+// Both http and https URLs are fetched on purpose: many Indonesian sources
+// are still http-only, and fetched content is transient (model context
+// only) — it is never persisted or executed. The SSRF guard applies to both
+// schemes equally.
 func Fetch(ctx context.Context, pageURL string) (title, content string, err error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, pageURL, nil)
 	if err != nil {
@@ -149,9 +159,12 @@ func Fetch(ctx context.Context, pageURL string) (title, content string, err erro
 		return "", "", fmt.Errorf("konten bukan HTML (%s)", contentType)
 	}
 
-	body, err := io.ReadAll(resp.Body)
+	body, err := io.ReadAll(io.LimitReader(resp.Body, maxBodyBytes+1))
 	if err != nil {
 		return "", "", err
+	}
+	if int64(len(body)) > maxBodyBytes {
+		return "", "", fmt.Errorf("konten terlalu besar (> %d bytes)", maxBodyBytes)
 	}
 
 	if t, c, ok := extractReadable(body, req.URL); ok {
@@ -220,6 +233,10 @@ func doWithRetry(client *http.Client, req *http.Request) (*http.Response, error)
 		return resp, err
 	}
 
-	time.Sleep(500 * time.Millisecond)
+	select {
+	case <-time.After(500 * time.Millisecond):
+	case <-req.Context().Done():
+		return nil, req.Context().Err()
+	}
 	return client.Do(req)
 }

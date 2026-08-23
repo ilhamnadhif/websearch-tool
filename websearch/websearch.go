@@ -8,6 +8,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/cookiejar"
@@ -22,6 +23,16 @@ import (
 )
 
 const resultLimit = 10
+
+// ErrBlocked means Bing served a CAPTCHA challenge instead of results. It is
+// transient: back off and retry after a few minutes.
+var ErrBlocked = errors.New("diblokir sementara oleh Bing (captcha) - request terlalu sering, coba lagi beberapa menit lagi")
+
+// ErrResultsNotParsed means Bing answered HTTP 200 but the page contained
+// neither result blocks nor its standard "no results" marker. This usually
+// signals a markup change on Bing's side, not an empty query — treat it as a
+// breakage rather than as zero results.
+var ErrResultsNotParsed = errors.New("hasil bing tidak bisa di-parse (kemungkinan struktur halaman berubah)")
 
 var userAgent = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"
 
@@ -41,8 +52,13 @@ type Response struct {
 }
 
 // Search queries Bing for query and returns up to 10 results. ctx controls
-// cancellation and timeout for the request. Search returns an error if the
-// request fails or if Bing temporarily blocks it with a CAPTCHA challenge.
+// cancellation and timeout for the request.
+//
+// Errors callers should distinguish with errors.Is:
+//   - ErrBlocked: CAPTCHA challenge, back off and retry later
+//   - ErrResultsNotParsed: HTTP 200 but unparseable markup (likely breakage)
+//
+// A legitimately empty result set returns (Response, nil) with zero results.
 func Search(ctx context.Context, query string) (Response, error) {
 	searchURL := "https://www.bing.com/search?q=" + url.QueryEscape(query)
 
@@ -51,7 +67,12 @@ func Search(ctx context.Context, query string) (Response, error) {
 		return Response{}, err
 	}
 
-	return Response{Query: query, Results: extractResults(doc)}, nil
+	results := extractResults(doc)
+	if len(results) == 0 && !hasNoResultsMarker(doc) {
+		return Response{}, ErrResultsNotParsed
+	}
+
+	return Response{Query: query, Results: results}, nil
 }
 
 func extractResults(doc *goquery.Document) []Result {
@@ -95,6 +116,9 @@ func extractResults(doc *goquery.Document) []Result {
 
 var cookieMu sync.Mutex
 
+// fetchDocument holds cookieMu across the whole request on purpose: it both
+// guards the shared cookie file and deliberately serializes outbound
+// searches, lowering the chance of tripping Bing's anti-bot checks.
 func fetchDocument(ctx context.Context, searchURL string) (*goquery.Document, error) {
 	target, err := url.Parse(searchURL)
 	if err != nil {
@@ -146,10 +170,16 @@ func fetchDocument(ctx context.Context, searchURL string) (*goquery.Document, er
 	}
 
 	if doc.Find("#turnstile-widget, .captcha_header").Length() > 0 {
-		return nil, fmt.Errorf("diblokir sementara oleh Bing (captcha) - request terlalu sering, coba lagi beberapa menit lagi")
+		return nil, ErrBlocked
 	}
 
 	return doc, nil
+}
+
+// hasNoResultsMarker reports whether the page carries Bing's standard
+// "no results" notice (li.b_no), which makes an empty result set legitimate.
+func hasNoResultsMarker(doc *goquery.Document) bool {
+	return doc.Find("li.b_no").Length() > 0
 }
 
 func cookieFilePath() (string, error) {
@@ -189,7 +219,8 @@ func saveCookies(path string, target *url.URL, jar *cookiejar.Jar) error {
 		return err
 	}
 
-	return os.WriteFile(path, data, 0o644)
+	// 0600: the file holds session cookies; other users must not read it.
+	return os.WriteFile(path, data, 0o600)
 }
 
 func doWithRetry(client *http.Client, req *http.Request) (*http.Response, error) {
@@ -198,7 +229,11 @@ func doWithRetry(client *http.Client, req *http.Request) (*http.Response, error)
 		return resp, err
 	}
 
-	time.Sleep(500 * time.Millisecond)
+	select {
+	case <-time.After(500 * time.Millisecond):
+	case <-req.Context().Done():
+		return nil, req.Context().Err()
+	}
 	return client.Do(req)
 }
 

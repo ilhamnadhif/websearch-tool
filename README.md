@@ -30,6 +30,7 @@ Both packages are independent of each other, so import only what you need. For a
 ```go
 import (
 	"context"
+	"errors"
 	"fmt"
 	"time"
 
@@ -40,8 +41,12 @@ ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 defer cancel()
 
 resp, err := websearch.Search(ctx, "golang context cancellation")
-if err != nil {
-	// handle error (e.g. temporarily blocked by Bing's anti-bot check)
+if errors.Is(err, websearch.ErrBlocked) {
+	// Bing served a CAPTCHA — back off and retry after a few minutes.
+}
+if errors.Is(err, websearch.ErrResultsNotParsed) {
+	// HTTP 200 but the markup no longer matches: treat as breakage,
+	// not as an empty result set.
 }
 
 for _, r := range resp.Results {
@@ -129,12 +134,14 @@ The example's system prompt tells the model to always search before answering, w
 ## Security notes
 
 - `fetchpage` validates the destination IP at connection time (not just the hostname), so DNS rebinding and redirects to internal addresses are both blocked.
-- Only `http`/`https` URLs are fetched.
+- Only `http`/`https` URLs are fetched. Both schemes are allowed on purpose — many Indonesian sources are still http-only — and fetched content is transient (model context only), never persisted or executed.
+- Page bodies larger than 5 MB are rejected instead of being read into memory.
 - `FetchMany` caps requests at 5 URLs per call to limit how much fan-out a single tool call can trigger.
+- Bing cookies are cached locally with `0600` permissions to reduce CAPTCHA challenges.
 
 ## Known limitations
 
-- Search relies on scraping Bing's HTML (`li.b_algo` markup), which can break silently if Bing changes its page structure, and Bing may temporarily block requests with a CAPTCHA under heavy use.
+- Search relies on scraping Bing's HTML (`li.b_algo` markup). A markup change is not silent: when a page contains neither result blocks nor Bing's standard "no results" marker, `Search` returns `ErrResultsNotParsed`. Heavy use may still earn a transient CAPTCHA, surfaced as `ErrBlocked`.
 - `fetchpage` only handles HTML pages — PDFs and other non-HTML content are rejected.
 - Extracted content is truncated to 4000 characters (UTF-8 rune-safe).
 
