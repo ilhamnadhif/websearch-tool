@@ -137,3 +137,7 @@ The example's system prompt tells the model to always search before answering, w
 - Search relies on scraping Bing's HTML (`li.b_algo` markup), which can break silently if Bing changes its page structure, and Bing may temporarily block requests with a CAPTCHA under heavy use.
 - `fetchpage` only handles HTML pages — PDFs and other non-HTML content are rejected.
 - Extracted content is truncated to 4000 characters (UTF-8 rune-safe).
+
+## License
+
+[MIT](LICENSE)
