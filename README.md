@@ -1,6 +1,6 @@
 # websearch-tool
 
-A small Go toolkit that gives an LLM two tool-calling capabilities: **searching the web** and **reading a page's full content**. It ships as two importable packages (`websearch`, `fetchpage`) plus a CLI (`main.go`) that wires them into an OpenAI-compatible tool-calling loop via [OpenRouter](https://openrouter.ai/).
+A small Go toolkit that gives an LLM two tool-calling capabilities: **searching the web** and **reading a page's full content**. It ships as two importable packages (`websearch`, `fetchpage`) plus a reference CLI (`main.go`) that wires them into an OpenAI-compatible tool-calling loop via [OpenRouter](https://openrouter.ai/).
 
 ## Features
 
@@ -8,54 +8,22 @@ A small Go toolkit that gives an LLM two tool-calling capabilities: **searching 
 - `fetchpage.Fetch` / `fetchpage.FetchMany` — downloads one or more URLs in parallel and extracts clean article text (via [go-readability](https://codeberg.org/readeck/go-readability), with a manual strip-tag fallback for non-article pages like listings).
 - SSRF-safe by default: `fetchpage` refuses to connect to loopback, private, link-local (including cloud metadata endpoints), or unspecified/multicast addresses, and validates the resolved IP at dial time so redirects can't bypass the check.
 - Both packages accept a `context.Context`, so callers control cancellation and deadlines instead of relying on fixed internal timeouts.
-- The CLI demonstrates a full tool-calling loop against an OpenAI-compatible chat API (OpenRouter + DeepSeek by default), with retry-on-transient-network-error and a graceful "answer with what you have" fallback when the turn/time budget runs out.
+- A reference CLI demonstrates a full tool-calling loop against an OpenAI-compatible chat API (OpenRouter + DeepSeek by default), with retry-on-transient-network-error and a graceful "answer with what you have" fallback when the turn/time budget runs out.
 
 ## Requirements
 
 - Go 1.26+
-- An [OpenRouter](https://openrouter.ai/keys) API key (only needed to run the CLI — the `websearch`/`fetchpage` packages work standalone without it)
+- An [OpenRouter](https://openrouter.ai/keys) API key (only needed to run the reference CLI — the `websearch`/`fetchpage` packages work standalone without it)
 
-## Install / Build
-
-```bash
-git clone git@github.com:ilhamnadhif/websearch-tool.git
-cd websearch-tool
-go build -o websearch-tool .
-```
-
-## Configure the CLI
-
-The CLI needs an OpenRouter API key. Open `main.go` and set it:
-
-```go
-const openRouterAPIKey = "sk-or-v1-..."
-```
-
-By default the CLI targets `deepseek/deepseek-v4-flash-0731` routed through the `DeepInfra` provider. Both are constants near the top of `main.go` if you want to change them.
-
-## CLI Usage
+## Install
 
 ```bash
-go run . "what's the weather in Kudus today?"
+go get github.com/ilhamnadhif/websearch-tool
 ```
 
-Tool calls and per-turn API call counts are logged to stderr; the final answer is printed to stdout:
+## Usage
 
-```
-[model] panggilan API ke-1
-[tool] web_search({"query": "weather in Kudus today"})
-[model] panggilan API ke-2
-[tool] fetch_page({"urls": ["https://www.bmkg.go.id/..."]})
-[model] panggilan API ke-3
-[ringkasan] 3 panggilan model API, 2 tool call
-Based on BMKG data, Kudus is expected to be sunny today with a high of ~33°C...
-```
-
-Unquoted multi-word questions also work — all CLI arguments are joined into a single question.
-
-## Using the packages as a library
-
-Both packages have no dependency on the CLI or on each other's internals, so you can import them directly into your own application.
+Both packages are independent of each other and of the CLI, so import only what you need.
 
 ### `websearch`
 
@@ -110,20 +78,48 @@ for _, r := range results {
 }
 ```
 
-### Importing from another module
+## Running the reference CLI
 
-This repo's module path is `github.com/ilhamnadhif/websearch-tool`, so from any other Go module you can just:
+The CLI is a runnable demo of both packages wired into an LLM tool-calling loop — useful as a reference implementation, not required for using the packages themselves.
 
 ```bash
-go get github.com/ilhamnadhif/websearch-tool
+git clone git@github.com:ilhamnadhif/websearch-tool.git
+cd websearch-tool
 ```
 
-and import `github.com/ilhamnadhif/websearch-tool/websearch` / `.../fetchpage` as shown above.
+Open `main.go` and set your OpenRouter API key:
+
+```go
+const openRouterAPIKey = "sk-or-v1-..."
+```
+
+By default it targets `deepseek/deepseek-v4-flash-0731` routed through the `DeepInfra` provider — both are constants near the top of `main.go` if you want to change them.
+
+Then build and run:
+
+```bash
+go build -o websearch-tool .
+./websearch-tool "what's the weather in Kudus today?"
+```
+
+Tool calls and per-turn API call counts are logged to stderr; the final answer is printed to stdout:
+
+```
+[model] panggilan API ke-1
+[tool] web_search({"query": "weather in Kudus today"})
+[model] panggilan API ke-2
+[tool] fetch_page({"urls": ["https://www.bmkg.go.id/..."]})
+[model] panggilan API ke-3
+[ringkasan] 3 panggilan model API, 2 tool call
+Based on BMKG data, Kudus is expected to be sunny today with a high of ~33°C...
+```
+
+Unquoted multi-word questions also work — all CLI arguments are joined into a single question.
 
 ## How it works
 
 ```
-main.go            orchestrates an OpenAI-compatible tool-calling loop
+main.go            reference CLI: orchestrates an OpenAI-compatible tool-calling loop
   ├─ websearch/     tool "web_search": Bing HTML scrape -> []Result
   └─ fetchpage/     tool "fetch_page": URL -> extracted title + content
 ```
