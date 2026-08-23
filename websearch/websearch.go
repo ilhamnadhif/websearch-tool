@@ -24,6 +24,11 @@ import (
 
 const resultLimit = 10
 
+// SearchEndpoint is the base results URL queried by Search, appended with
+// "?q=<escaped query>". Override it only in tests to point Search at a stub
+// server; production code should leave it unset.
+var SearchEndpoint = "https://www.bing.com/search"
+
 // ErrBlocked means Bing served a CAPTCHA challenge instead of results. It is
 // transient: back off and retry after a few minutes.
 var ErrBlocked = errors.New("diblokir sementara oleh Bing (captcha) - request terlalu sering, coba lagi beberapa menit lagi")
@@ -60,7 +65,7 @@ type Response struct {
 //
 // A legitimately empty result set returns (Response, nil) with zero results.
 func Search(ctx context.Context, query string) (Response, error) {
-	searchURL := "https://www.bing.com/search?q=" + url.QueryEscape(query)
+	searchURL := SearchEndpoint + "?q=" + url.QueryEscape(query)
 
 	doc, err := fetchDocument(ctx, searchURL)
 	if err != nil {
