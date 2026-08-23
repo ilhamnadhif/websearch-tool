@@ -1,3 +1,7 @@
+// Package websearch searches the web via Bing over plain HTTP and returns a
+// list of results (title, URL, domain, snippet) without fetching the pages'
+// own content. Use package fetchpage to read a specific result's full page
+// content.
 package websearch
 
 import (
@@ -21,6 +25,7 @@ const resultLimit = 10
 
 var userAgent = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"
 
+// Result is a single search result entry.
 type Result struct {
 	Rank    int    `json:"rank"`
 	Title   string `json:"title"`
@@ -29,11 +34,15 @@ type Result struct {
 	Snippet string `json:"snippet"`
 }
 
+// Response is the outcome of one Search call.
 type Response struct {
 	Query   string   `json:"query"`
 	Results []Result `json:"results"`
 }
 
+// Search queries Bing for query and returns up to 10 results. ctx controls
+// cancellation and timeout for the request. Search returns an error if the
+// request fails or if Bing temporarily blocks it with a CAPTCHA challenge.
 func Search(ctx context.Context, query string) (Response, error) {
 	searchURL := "https://www.bing.com/search?q=" + url.QueryEscape(query)
 

@@ -1,3 +1,7 @@
+// Package fetchpage downloads a web page and extracts its title and main
+// text content. It only fetches http/https URLs and refuses to connect to
+// private, loopback, or link-local addresses. Use package websearch to find
+// candidate URLs to fetch.
 package fetchpage
 
 import (
@@ -65,6 +69,8 @@ func safeDialContext(ctx context.Context, network, addr string) (net.Conn, error
 	return nil, fmt.Errorf("%s mengarah ke jaringan privat/internal - diblokir", host)
 }
 
+// Result is the outcome of fetching one URL. If Error is non-empty, the
+// fetch failed and Title/Content are left empty.
 type Result struct {
 	URL     string `json:"url"`
 	Title   string `json:"title,omitempty"`
@@ -72,6 +78,10 @@ type Result struct {
 	Error   string `json:"error,omitempty"`
 }
 
+// FetchMany fetches multiple URLs concurrently (one goroutine per URL) and
+// returns one Result per URL, in the same order as urls. Requests are capped
+// at 5 URLs per call; any beyond that are dropped. ctx controls cancellation
+// and timeout for all fetches.
 func FetchMany(ctx context.Context, urls []string) []Result {
 	if len(urls) > maxURLsPerCall {
 		urls = urls[:maxURLsPerCall]
@@ -105,6 +115,11 @@ func FetchMany(ctx context.Context, urls []string) []Result {
 	return results
 }
 
+// Fetch downloads pageURL and extracts its title and main text content. It
+// tries readability-style extraction first (suited to articles and blog
+// posts) and falls back to a manual tag-stripping extraction when that
+// yields too little text, e.g. on product listing pages. Content is
+// truncated to 4000 characters. ctx controls cancellation and timeout.
 func Fetch(ctx context.Context, pageURL string) (title, content string, err error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, pageURL, nil)
 	if err != nil {
