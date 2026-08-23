@@ -4,11 +4,12 @@ A small Go toolkit that gives an LLM two tool-calling capabilities: **searching 
 
 ## Features
 
-- `websearch.Search` — queries Bing over plain HTTP (no headless browser) and returns up to 10 results (title, URL, domain, snippet).
+- `websearch.Search` — queries Bing over plain HTTP (no headless browser) and returns up to 10 results (title, URL, domain, snippet). If Bing serves a CAPTCHA or its markup changes, Search automatically falls back to DuckDuckGo's HTML endpoint.
+- Indonesian-first result locale by default (`mkt=id-ID` on Bing, `kl=id-id` on DuckDuckGo), so searches stay Indonesia-relevant even when run from a foreign VPS or VPN. Both are exported vars if you target another market.
 - `fetchpage.Fetch` / `fetchpage.FetchMany` — downloads one or more URLs in parallel and extracts clean article text (via [go-readability](https://codeberg.org/readeck/go-readability), with a manual strip-tag fallback for non-article pages like listings).
 - SSRF-safe by default: `fetchpage` refuses to connect to loopback, private, link-local (including cloud metadata endpoints), or unspecified/multicast addresses, and validates the resolved IP at dial time so redirects can't bypass the check.
 - Both packages accept a `context.Context`, so callers control cancellation and deadlines instead of relying on fixed internal timeouts.
-- A reference orchestration example demonstrates a full tool-calling loop against an OpenAI-compatible chat API (OpenRouter + DeepSeek by default), with retry-on-transient-network-error and a graceful "answer with what you have" fallback when the turn/time budget runs out.
+- A reference orchestration example demonstrates a full tool-calling loop against an OpenAI-compatible chat API (OpenRouter + DeepSeek by default). Tool calls requested within one turn execute concurrently; it retries transient network errors once and degrades gracefully to an "answer with what you have" response when the turn/time budget runs out.
 
 ## Requirements
 
@@ -42,10 +43,10 @@ defer cancel()
 
 resp, err := websearch.Search(ctx, "golang context cancellation")
 if errors.Is(err, websearch.ErrBlocked) {
-	// Bing served a CAPTCHA — back off and retry after a few minutes.
+	// Every engine served an anti-bot challenge — back off and retry later.
 }
 if errors.Is(err, websearch.ErrResultsNotParsed) {
-	// HTTP 200 but the markup no longer matches: treat as breakage,
+	// HTTP 200 but no engine's markup matched: treat as breakage,
 	// not as an empty result set.
 }
 
@@ -53,6 +54,8 @@ for _, r := range resp.Results {
 	fmt.Println(r.Rank, r.Title, r.URL, r.Site, r.Snippet)
 }
 ```
+
+Under the hood `Search` queries Bing first and retries via DuckDuckGo's HTML endpoint when Bing is blocked or unparseable — the sentinel errors above are only returned when every engine fails. The result locale defaults to Indonesian regardless of where the process runs; override `BingMarketParams` / `DuckDuckGoRegion` for other markets.
 
 ### `fetchpage`
 
@@ -125,7 +128,7 @@ Unquoted multi-word questions also work — all CLI arguments are joined into a 
 
 ```
 example/orchestration/main.go   orchestrates an OpenAI-compatible tool-calling loop
-websearch/                      tool "web_search": Bing HTML scrape -> []Result
+websearch/                      tool "web_search": Bing scrape -> []Result, DuckDuckGo fallback
 fetchpage/                      tool "fetch_page": URL -> extracted title + content
 ```
 
@@ -137,11 +140,11 @@ The example's system prompt tells the model to always search before answering, w
 - Only `http`/`https` URLs are fetched. Both schemes are allowed on purpose — many Indonesian sources are still http-only — and fetched content is transient (model context only), never persisted or executed.
 - Page bodies larger than 5 MB are rejected instead of being read into memory.
 - `FetchMany` caps requests at 5 URLs per call to limit how much fan-out a single tool call can trigger.
-- Bing cookies are cached locally with `0600` permissions to reduce CAPTCHA challenges.
+- Search cookies are cached locally per engine (Bing, DuckDuckGo) with `0600` permissions to reduce CAPTCHA challenges.
 
 ## Known limitations
 
-- Search relies on scraping Bing's HTML (`li.b_algo` markup). A markup change is not silent: when a page contains neither result blocks nor Bing's standard "no results" marker, `Search` returns `ErrResultsNotParsed`. Heavy use may still earn a transient CAPTCHA, surfaced as `ErrBlocked`.
+- Search scrapes Bing's HTML (`li.b_algo` markup) first, falling back to DuckDuckGo's (`div.web-result`). A markup change on either engine is not silent: when a page contains neither result blocks nor the engine's standard "no results" marker, that engine reports `ErrResultsNotParsed`; an anti-bot challenge on every engine surfaces as `ErrBlocked`. Heavy use may still earn transient CAPTCHAs on either engine.
 - `fetchpage` only handles HTML pages — PDFs and other non-HTML content are rejected.
 - Extracted content is truncated to 4000 characters (UTF-8 rune-safe).
 

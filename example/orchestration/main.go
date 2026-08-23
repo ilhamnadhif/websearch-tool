@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"os"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/ilhamnadhif/websearch-tool/fetchpage"
@@ -46,7 +47,11 @@ func main() {
 			Content: "Kamu asisten yang bisa cari info terbaru di internet. " +
 				"Pakai tool web_search dulu buat lihat kandidat sumber (title+snippet), " +
 				"baru pakai fetch_page untuk baca isi lengkap 1-3 URL yang paling relevan " +
-				"sebelum menjawab. Jangan fetch_page semua hasil search sekaligus.",
+				"sebelum menjawab. Jangan fetch_page semua hasil search sekaligus. " +
+				"Jika web_search diblokir captcha/rate-limit, JANGAN berhenti atau menyuruh user mencoba lagi: " +
+				"coba sekali lagi dengan query berbeda, dan kalau masih gagal langsung pakai fetch_page " +
+				"ke beberapa situs tepercaya yang relevan dengan pertanyaan (domain yang kamu ketahui sendiri), " +
+				"lalu jawab dari sana.",
 		},
 		{Role: "user", Content: question},
 	}
@@ -113,19 +118,37 @@ func main() {
 			return
 		}
 
-		for _, tc := range msg.ToolCalls {
+		// Execute all requested tools concurrently; results are kept aligned
+		// with msg.ToolCalls so each tool message matches its ToolCallID.
+		results := make([]string, len(msg.ToolCalls))
+
+		var wg sync.WaitGroup
+
+		for i, tc := range msg.ToolCalls {
 			toolCalls++
 			fmt.Fprintf(os.Stderr, "[tool] %s(%s)\n", tc.Function.Name, tc.Function.Arguments)
 
-			result, err := executeTool(ctx, tc.Function.Name, tc.Function.Arguments)
-			if err != nil {
-				result = fmt.Sprintf(`{"error": %q}`, err.Error())
-			}
+			wg.Add(1)
 
+			go func(i int, tc toolCall) {
+				defer wg.Done()
+
+				result, err := executeTool(ctx, tc.Function.Name, tc.Function.Arguments)
+				if err != nil {
+					result = fmt.Sprintf(`{"error": %q}`, err.Error())
+				}
+
+				results[i] = result
+			}(i, tc)
+		}
+
+		wg.Wait()
+
+		for i, tc := range msg.ToolCalls {
 			messages = append(messages, chatMessage{
 				Role:       "tool",
 				ToolCallID: tc.ID,
-				Content:    result,
+				Content:    results[i],
 			})
 		}
 	}

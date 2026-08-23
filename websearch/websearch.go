@@ -1,7 +1,9 @@
-// Package websearch searches the web via Bing over plain HTTP and returns a
-// list of results (title, URL, domain, snippet) without fetching the pages'
-// own content. Use package fetchpage to read a specific result's full page
-// content.
+// Package websearch searches the web over plain HTTP and returns a list of
+// results (title, URL, domain, snippet) without fetching the pages' own
+// content. Search queries Bing first and automatically falls back to
+// DuckDuckGo's HTML endpoint when Bing serves a CAPTCHA or its markup can no
+// longer be parsed. Use package fetchpage to read a specific result's full
+// page content.
 package websearch
 
 import (
@@ -24,10 +26,24 @@ import (
 
 const resultLimit = 10
 
-// SearchEndpoint is the base results URL queried by Search, appended with
+// SearchEndpoint is the base Bing results URL queried first, appended with
 // "?q=<escaped query>". Override it only in tests to point Search at a stub
 // server; production code should leave it unset.
 var SearchEndpoint = "https://www.bing.com/search"
+
+// DuckDuckGoEndpoint is the fallback HTML results endpoint queried when Bing
+// serves a CAPTCHA or unparseable markup. Override it only in tests.
+var DuckDuckGoEndpoint = "https://html.duckduckgo.com/html"
+
+// BingMarketParams forces Bing's Indonesian result market regardless of where
+// the request originates (VPS/VPN abroad), appended to the search URL
+// verbatim. Override it if your audience is elsewhere.
+var BingMarketParams = "mkt=id-ID&setlang=id&cc=ID"
+
+// DuckDuckGoRegion biases the fallback engine toward Indonesian results via
+// its kl=<region> parameter, mitigating IP-based localization when running
+// from a foreign VPS or VPN.
+var DuckDuckGoRegion = "id-id"
 
 // ErrBlocked means Bing served a CAPTCHA challenge instead of results. It is
 // transient: back off and retry after a few minutes.
@@ -64,10 +80,36 @@ type Response struct {
 //   - ErrResultsNotParsed: HTTP 200 but unparseable markup (likely breakage)
 //
 // A legitimately empty result set returns (Response, nil) with zero results.
+// Search queries query and returns up to 10 results. It queries Bing first;
+// when Bing serves a CAPTCHA or its markup can no longer be parsed, it
+// automatically retries against DuckDuckGo's HTML endpoint. ctx controls
+// cancellation and timeout for the requests.
+//
+// Errors callers should distinguish with errors.Is — they are only returned
+// when every engine fails:
+//   - ErrBlocked: CAPTCHA/challenge on all engines, back off and retry later
+//   - ErrResultsNotParsed: HTTP 200 but unparseable markup everywhere (likely breakage)
+//
+// A legitimately empty result set returns (Response, nil) with zero results.
 func Search(ctx context.Context, query string) (Response, error) {
-	searchURL := SearchEndpoint + "?q=" + url.QueryEscape(query)
+	resp, err := searchBing(ctx, query)
+	if err == nil {
+		return resp, nil
+	}
 
-	doc, err := fetchDocument(ctx, searchURL)
+	if errors.Is(err, ErrBlocked) || errors.Is(err, ErrResultsNotParsed) {
+		if ddgResp, ddgErr := searchDuckDuckGo(ctx, query); ddgErr == nil {
+			return ddgResp, nil
+		}
+	}
+
+	return Response{}, err
+}
+
+func searchBing(ctx context.Context, query string) (Response, error) {
+	searchURL := SearchEndpoint + "?q=" + url.QueryEscape(query) + "&" + BingMarketParams
+
+	doc, err := fetchDocument(ctx, searchURL, "cookies.json")
 	if err != nil {
 		return Response{}, err
 	}
@@ -78,6 +120,104 @@ func Search(ctx context.Context, query string) (Response, error) {
 	}
 
 	return Response{Query: query, Results: results}, nil
+}
+
+func searchDuckDuckGo(ctx context.Context, query string) (Response, error) {
+	searchURL := DuckDuckGoEndpoint + "/?q=" + url.QueryEscape(query) +
+		"&kl=" + DuckDuckGoRegion
+
+	doc, err := fetchDocument(ctx, searchURL, "cookies-ddg.json")
+	if err != nil {
+		return Response{}, err
+	}
+
+	if docHasDDGBlock(doc) {
+		return Response{}, ErrBlocked
+	}
+
+	results := extractDDGResults(doc)
+	if len(results) == 0 && !hasDDGNoResultsMarker(doc) {
+		return Response{}, ErrResultsNotParsed
+	}
+
+	return Response{Query: query, Results: results}, nil
+}
+
+// docHasDDGBlock reports whether the page is DuckDuckGo's anti-bot notice
+// rather than a results page.
+func docHasDDGBlock(doc *goquery.Document) bool {
+	text := strings.ToLower(doc.Find("body").Text())
+
+	return strings.Contains(text, "bots use duckduckgo") ||
+		strings.Contains(text, "unusual traffic")
+}
+
+// hasDDGNoResultsMarker reports whether the page carries DuckDuckGo's
+// standard "no results" notice, making an empty result set legitimate.
+func hasDDGNoResultsMarker(doc *goquery.Document) bool {
+	return doc.Find("div.no-results").Length() > 0
+}
+
+func extractDDGResults(doc *goquery.Document) []Result {
+	blocks := doc.Find("div.web-result")
+
+	var results []Result
+
+	blocks.EachWithBreak(func(i int, block *goquery.Selection) bool {
+		if i >= resultLimit {
+			return false
+		}
+
+		link := block.Find("a.result__a").First()
+		if link.Length() == 0 {
+			return true
+		}
+
+		title := strings.TrimSpace(link.Text())
+
+		href, ok := link.Attr("href")
+		if !ok {
+			return true
+		}
+
+		href = decodeDDGURL(href)
+		snippet := strings.TrimSpace(block.Find(".result__snippet").First().Text())
+
+		results = append(results, Result{
+			Rank:    i + 1,
+			Title:   title,
+			URL:     href,
+			Site:    getDomain(href),
+			Snippet: snippet,
+		})
+
+		return true
+	})
+
+	return results
+}
+
+// decodeDDGURL unwraps DuckDuckGo's //duckduckgo.com/l/?uddg=<escaped>
+// redirect links into their target URL; anything else passes through
+// unchanged.
+func decodeDDGURL(rawURL string) string {
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		return rawURL
+	}
+
+	host := strings.ToLower(u.Hostname())
+	if !strings.Contains(host, "duckduckgo.com") || u.Path != "/l/" {
+		return rawURL
+	}
+
+	target := u.Query().Get("uddg")
+	if strings.HasPrefix(target, "http://") ||
+		strings.HasPrefix(target, "https:") {
+		return target
+	}
+
+	return rawURL
 }
 
 func extractResults(doc *goquery.Document) []Result {
@@ -122,9 +262,9 @@ func extractResults(doc *goquery.Document) []Result {
 var cookieMu sync.Mutex
 
 // fetchDocument holds cookieMu across the whole request on purpose: it both
-// guards the shared cookie file and deliberately serializes outbound
-// searches, lowering the chance of tripping Bing's anti-bot checks.
-func fetchDocument(ctx context.Context, searchURL string) (*goquery.Document, error) {
+// guards the cookie files and deliberately serializes outbound searches,
+// lowering the chance of tripping the engines' anti-bot checks.
+func fetchDocument(ctx context.Context, searchURL, cookieFile string) (*goquery.Document, error) {
 	target, err := url.Parse(searchURL)
 	if err != nil {
 		return nil, err
@@ -146,7 +286,7 @@ func fetchDocument(ctx context.Context, searchURL string) (*goquery.Document, er
 
 	client := &http.Client{Timeout: 15 * time.Second, Jar: jar}
 
-	cookiePath, err := cookieFilePath()
+	cookiePath, err := cookieFilePath(cookieFile)
 
 	cookieMu.Lock()
 	defer cookieMu.Unlock()
@@ -187,7 +327,7 @@ func hasNoResultsMarker(doc *goquery.Document) bool {
 	return doc.Find("li.b_no").Length() > 0
 }
 
-func cookieFilePath() (string, error) {
+func cookieFilePath(name string) (string, error) {
 	dir, err := os.UserCacheDir()
 	if err != nil {
 		return "", err
@@ -199,7 +339,7 @@ func cookieFilePath() (string, error) {
 		return "", err
 	}
 
-	return filepath.Join(dir, "cookies.json"), nil
+	return filepath.Join(dir, name), nil
 }
 
 func loadCookies(path string, target *url.URL, jar *cookiejar.Jar) {

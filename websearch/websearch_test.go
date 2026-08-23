@@ -157,6 +157,117 @@ func TestSearchDistinguishesAnomalyFromEmpty(t *testing.T) {
 	}
 }
 
+func ddgRedirect(payload string) string {
+	return "//duckduckgo.com/l/?uddg=" + url.QueryEscape(payload) + "&rut=abc123"
+}
+
+func ddgResultBlock(href, title, snippet string) string {
+	return `<div class="web-result"><h2>` +
+		`<a rel="nofollow" class="result__a" href="` + href + `">` + title + `</a>` +
+		`</h2><a class="result__snippet" href="` + href + `">` + snippet + `</a></div>`
+}
+
+func TestDecodeDDGURLDirectPassthrough(t *testing.T) {
+	cases := []string{
+		"https://example.com/article",
+		"http://contoh.id/page?q=1",
+		"https://duckduckgo.com/search?q=test",
+		"https://example.com/l/?uddg=https%3A%2F%2Fother.com",
+	}
+
+	for _, tc := range cases {
+		if got := decodeDDGURL(tc); got != tc {
+			t.Errorf("decodeDDGURL(%q) = %q, want passthrough", tc, got)
+		}
+	}
+}
+
+func TestDecodeDDGURLRedirectVariants(t *testing.T) {
+	target := "https://example.com/artikel?a=1&b=2"
+
+	cases := []struct {
+		name string
+		raw  string
+		want string
+	}{
+		{"scheme-relative", ddgRedirect(target), target},
+		{"absolute", "https://duckduckgo.com/l/?uddg=" + url.QueryEscape(target), target},
+		{"http target", ddgRedirect("http://berita.id/lokal"), "http://berita.id/lokal"},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := decodeDDGURL(tc.raw); got != tc.want {
+				t.Errorf("decodeDDGURL() = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestDecodeDDGURLNonHTTPTarget(t *testing.T) {
+	raw := "https://duckduckgo.com/l/?uddg=ftp%3A%2F%2Fexample.com%2Ffile"
+	if got := decodeDDGURL(raw); got != raw {
+		t.Errorf("non-http uddg: got %q, want raw %q", got, raw)
+	}
+}
+
+func TestExtractDDGResultsMapsFieldsAndCapsAtLimit(t *testing.T) {
+	var sb strings.Builder
+	for i := range 13 {
+		sb.WriteString(ddgResultBlock(
+			ddgRedirect("https://contoh"+strings.Repeat("x", i)+".id/a"),
+			strings.Repeat("t", i+1),
+			"snippet",
+		))
+	}
+	sb.WriteString(`<div class="web-result"><div>tanpa tautan</div></div>`)
+
+	results := extractDDGResults(mustDoc(t, sb.String()))
+
+	if len(results) != resultLimit {
+		t.Fatalf("len(results) = %d, want capped %d", len(results), resultLimit)
+	}
+
+	first := results[0]
+	if first.Rank != 1 || first.Title == "" || first.Snippet != "snippet" {
+		t.Errorf("first result = %+v", first)
+	}
+	if got := first.URL; !strings.HasPrefix(got, "https://contoh") {
+		t.Errorf("first URL not decoded from redirect: %q", got)
+	}
+	if site := first.Site; strings.HasPrefix(site, "www.") || !strings.Contains(site, "contoh") {
+		t.Errorf("site = %q, want www-stripped domain", site)
+	}
+	last := results[resultLimit-1]
+	if last.Rank != resultLimit {
+		t.Errorf("last rank = %d, want %d", last.Rank, resultLimit)
+	}
+}
+
+func TestSearchDDEmptyLegitimateVsBroken(t *testing.T) {
+	empty := mustDoc(t, `<html><body><div class="no-results">No results</div></body></html>`)
+	if len(extractDDGResults(empty)) != 0 || !hasDDGNoResultsMarker(empty) {
+		t.Fatal("fixture should represent a legitimate empty result set")
+	}
+
+	broken := mustDoc(t, `<html><body><p>halaman aneh tanpa hasil</p></body></html>`)
+	if len(extractDDGResults(broken)) != 0 || hasDDGNoResultsMarker(broken) {
+		t.Fatal("fixture should represent broken markup")
+	}
+}
+
+func TestDocHasDDGBlock(t *testing.T) {
+	blocked := mustDoc(t, `<html><body><main><p>Unfortunately, bots use DuckDuckGo too.</p></main></body></html>`)
+	if !docHasDDGBlock(blocked) {
+		t.Error("halaman anti-bot tidak terdeteksi")
+	}
+
+	clean := mustDoc(t, `<html><body><p>hasil pencarian normal</p></body></html>`)
+	if docHasDDGBlock(clean) {
+		t.Error("halaman normal terdeteksi sebagai blokir")
+	}
+}
+
 func TestGetDomain(t *testing.T) {
 	cases := map[string]string{
 		"https://www.example.com/a":        "example.com",
