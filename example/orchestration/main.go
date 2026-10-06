@@ -47,7 +47,8 @@ func main() {
 			Content: "Kamu asisten yang bisa cari info terbaru di internet. " +
 				"Pakai tool web_search dulu buat lihat kandidat sumber (title+snippet), " +
 				"baru pakai fetch_page untuk baca isi lengkap 1-3 URL yang paling relevan " +
-				"sebelum menjawab. Jangan fetch_page semua hasil search sekaligus. " +
+				"sebelum menjawab, dengan focus berisi apa yang dicari di halaman itu. " +
+				"Jangan fetch_page semua hasil search sekaligus. " +
 				"Jika web_search diblokir captcha/rate-limit, JANGAN berhenti atau menyuruh user mencoba lagi: " +
 				"coba sekali lagi dengan query berbeda, dan kalau masih gagal langsung pakai fetch_page " +
 				"ke beberapa situs tepercaya yang relevan dengan pertanyaan (domain yang kamu ketahui sendiri), " +
@@ -75,7 +76,7 @@ func main() {
 			Type: "function",
 			Function: functionDef{
 				Name:        "fetch_page",
-				Description: "Ambil isi lengkap satu atau beberapa URL (hasil dari web_search).",
+				Description: "Ambil isi satu atau beberapa URL (hasil dari web_search). Tabel tetap utuh (sel dipisah \" | \"), judul bagian diawali \"## \".",
 				Parameters: json.RawMessage(`{
 					"type": "object",
 					"properties": {
@@ -83,6 +84,10 @@ func main() {
 							"type": "array",
 							"items": {"type": "string"},
 							"description": "Daftar URL yang mau dibaca isi lengkapnya"
+						},
+						"focus": {
+							"type": "string",
+							"description": "Apa yang dicari di halaman, mis. \"harga emas 1 gram\". Halaman panjang dipotong ke bagian yang paling cocok."
 						}
 					},
 					"required": ["urls"]
@@ -168,22 +173,34 @@ func executeTool(ctx context.Context, name, argsJSON string) (string, error) {
 		}
 
 		resp, err := websearch.Search(ctx, args.Query)
+
+		var engines []string
+		for _, a := range resp.Attempts {
+			engines = append(engines, a.Engine+"="+a.Outcome)
+		}
+		fmt.Fprintf(os.Stderr, "[search] %s\n", strings.Join(engines, " "))
+
 		if err != nil {
 			return "", err
 		}
 
-		b, err := json.Marshal(resp)
+		// The model needs the results, not which engines were asked.
+		b, err := json.Marshal(struct {
+			Query   string             `json:"query"`
+			Results []websearch.Result `json:"results"`
+		}{resp.Query, resp.Results})
 		return string(b), err
 
 	case "fetch_page":
 		var args struct {
-			URLs []string `json:"urls"`
+			URLs  []string `json:"urls"`
+			Focus string   `json:"focus"`
 		}
 		if err := json.Unmarshal([]byte(argsJSON), &args); err != nil {
 			return "", fmt.Errorf("argumen fetch_page tidak valid: %w", err)
 		}
 
-		results := fetchpage.FetchMany(ctx, args.URLs)
+		results := fetchpage.FetchManyWithOptions(ctx, args.URLs, fetchpage.Options{Focus: args.Focus})
 
 		b, err := json.Marshal(results)
 		return string(b), err

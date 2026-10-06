@@ -1,61 +1,75 @@
-// Package websearch searches the web over plain HTTP and returns a list of
-// results (title, URL, domain, snippet) without fetching the pages' own
-// content. Search queries Bing first and automatically falls back to
-// DuckDuckGo's HTML endpoint when Bing serves a CAPTCHA or its markup can no
-// longer be parsed. Use package fetchpage to read a specific result's full
-// page content.
+// Package websearch searches the web over plain HTTP and returns ranked
+// results (title, URL, domain, snippet) without fetching the pages
+// themselves. Use package fetchpage to read a result's page.
+//
+// Search asks a chain of engines in turn and returns the first answer that is
+// actually about the query: Brave Search when an API key is set, then Bing,
+// DuckDuckGo, Bing News, and Wikipedia. Scraped engines fail in two quiet
+// ways that look like answers. A datacenter IP often gets Bing's "no
+// results" page whatever it asks, and some networks get a full page of
+// unrelated decoy links. Search treats both as a miss and moves on, so an
+// empty Response means every engine came back empty, not just the first.
 package websearch
 
 import (
 	"context"
-	"encoding/base64"
-	"encoding/json"
 	"errors"
 	"fmt"
-	"net/http"
-	"net/http/cookiejar"
 	"net/url"
-	"os"
-	"path/filepath"
 	"strings"
-	"sync"
 	"time"
-
-	"github.com/PuerkitoBio/goquery"
 )
 
 const resultLimit = 10
 
-// SearchEndpoint is the base Bing results URL queried first, appended with
-// "?q=<escaped query>". Override it only in tests to point Search at a stub
-// server; production code should leave it unset.
-var SearchEndpoint = "https://www.bing.com/search"
+// Engine names, as used in Engines, Response.Engine and Attempt.Engine.
+const (
+	EngineBrave      = "brave"
+	EngineBing       = "bing"
+	EngineDuckDuckGo = "duckduckgo"
+	EngineBingNews   = "bing-news"
+	EngineWikipedia  = "wikipedia"
+)
 
-// DuckDuckGoEndpoint is the fallback HTML results endpoint queried when Bing
-// serves a CAPTCHA or unparseable markup. Override it only in tests.
-var DuckDuckGoEndpoint = "https://html.duckduckgo.com/html"
+// Engines is the order Search asks the engines in. Brave is skipped while
+// BraveAPIKey is empty, and unknown names are ignored. Like the other
+// package settings, set it once at startup, before the first Search.
+var Engines = []string{EngineBrave, EngineBing, EngineDuckDuckGo, EngineBingNews, EngineWikipedia}
 
-// BingMarketParams forces Bing's Indonesian result market regardless of where
-// the request originates (VPS/VPN abroad), appended to the search URL
-// verbatim. Override it if your audience is elsewhere.
-var BingMarketParams = "mkt=id-ID&setlang=id&cc=ID"
+// AttemptTimeout bounds one engine's request, so an engine that hangs leaves
+// time for the rest of the chain. The caller's context still bounds the
+// whole search.
+var AttemptTimeout = 6 * time.Second
 
-// DuckDuckGoRegion biases the fallback engine toward Indonesian results via
-// its kl=<region> parameter, mitigating IP-based localization when running
-// from a foreign VPS or VPN.
-var DuckDuckGoRegion = "id-id"
+// Outcomes of one engine attempt, as reported in Attempt.Outcome.
+const (
+	OutcomeOK        = "ok"         // relevant results; Search returned them
+	OutcomeEmpty     = "empty"      // no results (possibly a soft block)
+	OutcomeUnrelated = "unrelated"  // results about something else; discarded
+	OutcomeBlocked   = "blocked"    // challenge or rate limit; the engine now cools down
+	OutcomeCooldown  = "cooldown"   // skipped: still cooling down from a block
+	OutcomeNoTime    = "no_time"    // skipped: too little of the deadline left
+	OutcomeNotParsed = "not_parsed" // page did not parse (markup changed?)
+	OutcomeError     = "error"      // network or HTTP failure
+)
 
-// ErrBlocked means Bing served a CAPTCHA challenge instead of results. It is
-// transient: back off and retry after a few minutes.
-var ErrBlocked = errors.New("diblokir sementara oleh Bing (captcha) - request terlalu sering, coba lagi beberapa menit lagi")
+// ErrBlocked means at least one engine refused with a challenge or a rate
+// limit and none of the others found anything. It is transient: back off and
+// retry after a few minutes.
+var ErrBlocked = errors.New("diblokir sementara oleh mesin pencari (captcha/rate limit) - coba lagi beberapa menit lagi")
 
-// ErrResultsNotParsed means Bing answered HTTP 200 but the page contained
-// neither result blocks nor its standard "no results" marker. This usually
-// signals a markup change on Bing's side, not an empty query — treat it as a
-// breakage rather than as zero results.
-var ErrResultsNotParsed = errors.New("hasil bing tidak bisa di-parse (kemungkinan struktur halaman berubah)")
+// ErrResultsNotParsed means an engine answered but its page matched neither
+// its result markup nor its "no results" notice, and no other engine found
+// anything. It signals a markup change, not an empty query.
+var ErrResultsNotParsed = errors.New("hasil pencarian tidak bisa di-parse (kemungkinan struktur halaman berubah)")
 
-var userAgent = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"
+// ErrEmptyQuery means the query was blank.
+var ErrEmptyQuery = errors.New("query pencarian kosong")
+
+var (
+	errNoEngines = errors.New("tidak ada mesin pencari yang aktif")
+	errTimeShort = errors.New("waktu habis sebelum semua mesin pencari sempat dicoba")
+)
 
 // Result is a single search result entry.
 type Result struct {
@@ -64,322 +78,274 @@ type Result struct {
 	URL     string `json:"url"`
 	Site    string `json:"site"`
 	Snippet string `json:"snippet"`
+	// Published is the article's date when the engine reports one (Bing
+	// News, Brave). It is zero otherwise; a date may still appear in the
+	// snippet's text.
+	Published time.Time `json:"published,omitzero"`
+}
+
+// Attempt records what one engine did during a Search.
+type Attempt struct {
+	Engine     string `json:"engine"`
+	Outcome    string `json:"outcome"`
+	Results    int    `json:"results"`
+	DurationMS int64  `json:"duration_ms"`
+	Error      string `json:"error,omitempty"`
 }
 
 // Response is the outcome of one Search call.
 type Response struct {
 	Query   string   `json:"query"`
 	Results []Result `json:"results"`
+	// Engine names the engine whose results these are; empty when none had
+	// any.
+	Engine string `json:"engine,omitempty"`
+	// Cached reports that the answer came from the in-memory cache (see
+	// CacheTTL) rather than from the engines just now.
+	Cached bool `json:"cached,omitempty"`
+	// Attempts lists the engines asked, in order. It names no query text,
+	// so it is safe to log.
+	Attempts []Attempt `json:"attempts,omitempty"`
 }
 
-// Search queries Bing for query and returns up to 10 results. ctx controls
-// cancellation and timeout for the request.
+// engineError carries what the chain should do after an engine failed: count
+// it as a block, and how long to leave the engine alone.
+type engineError struct {
+	msg      string
+	blocked  bool
+	cooldown time.Duration
+}
+
+func (e *engineError) Error() string { return e.msg }
+
+func (e *engineError) Unwrap() error {
+	if e.blocked {
+		return ErrBlocked
+	}
+	return nil
+}
+
+type engine struct {
+	name     string
+	gate     *gate
+	cooldown time.Duration // how long a challenge keeps the engine out
+	strict   bool          // serves decoys: judge relevance strictly (see filterRelevant)
+	enabled  func() bool
+	search   func(context.Context, string) ([]Result, error)
+}
+
+// The pacing intervals keep bursts (a model firing several searches in one
+// step) under each engine's patience. DuckDuckGo's is the long one: it
+// challenges a second request that follows the first too closely.
+var engines = map[string]*engine{
+	EngineBrave: {
+		name: EngineBrave, gate: &gate{interval: 1100 * time.Millisecond}, cooldown: time.Minute,
+		enabled: func() bool { return BraveAPIKey != "" }, search: searchBrave,
+	},
+	EngineBing: {
+		name: EngineBing, gate: &gate{interval: 500 * time.Millisecond}, cooldown: 10 * time.Minute,
+		strict: true, search: searchBing,
+	},
+	EngineDuckDuckGo: {
+		name: EngineDuckDuckGo, gate: &gate{interval: 2500 * time.Millisecond}, cooldown: 10 * time.Minute,
+		search: searchDuckDuckGo,
+	},
+	EngineBingNews: {
+		name: EngineBingNews, gate: &gate{interval: 500 * time.Millisecond}, cooldown: 5 * time.Minute,
+		search: searchBingNews,
+	},
+	EngineWikipedia: {
+		name: EngineWikipedia, gate: &gate{interval: 200 * time.Millisecond}, cooldown: time.Minute,
+		search: searchWikipedia,
+	},
+}
+
+// Search returns up to 10 results for query from the first engine in
+// Engines whose answer is about the query. ctx bounds the whole chain;
+// AttemptTimeout bounds each engine within it.
 //
-// Errors callers should distinguish with errors.Is:
-//   - ErrBlocked: CAPTCHA challenge, back off and retry later
-//   - ErrResultsNotParsed: HTTP 200 but unparseable markup (likely breakage)
+// The error is nil whenever results were found, and also when every engine
+// answered without finding anything relevant: that is a genuinely empty
+// result. Otherwise, check it with errors.Is:
+//   - ErrBlocked: an engine refused (challenge or rate limit); retry later
+//   - ErrResultsNotParsed: an engine's page did not parse (markup change)
+//   - the context's error, when ctx ended first
 //
-// A legitimately empty result set returns (Response, nil) with zero results.
-// Search queries query and returns up to 10 results. It queries Bing first;
-// when Bing serves a CAPTCHA or its markup can no longer be parsed, it
-// automatically retries against DuckDuckGo's HTML endpoint. ctx controls
-// cancellation and timeout for the requests.
-//
-// Errors callers should distinguish with errors.Is — they are only returned
-// when every engine fails:
-//   - ErrBlocked: CAPTCHA/challenge on all engines, back off and retry later
-//   - ErrResultsNotParsed: HTTP 200 but unparseable markup everywhere (likely breakage)
-//
-// A legitimately empty result set returns (Response, nil) with zero results.
+// Response.Attempts says what each engine did, in either case.
 func Search(ctx context.Context, query string) (Response, error) {
-	resp, err := searchBing(ctx, query)
-	if err == nil {
-		return resp, nil
+	query = strings.TrimSpace(query)
+	resp := Response{Query: query}
+
+	if query == "" {
+		return resp, ErrEmptyQuery
 	}
 
-	if errors.Is(err, ErrBlocked) || errors.Is(err, ErrResultsNotParsed) {
-		if ddgResp, ddgErr := searchDuckDuckGo(ctx, query); ddgErr == nil {
-			return ddgResp, nil
+	key := cacheKey(query)
+	if cached, ok := searchCache.get(key); ok {
+		cached.Query = query
+		cached.Cached = true
+		return cached, nil
+	}
+
+	chain := activeEngines()
+	if len(chain) == 0 {
+		return resp, errNoEngines
+	}
+
+	var (
+		blocked   bool
+		notParsed bool
+		lastErr   error
+	)
+
+	for _, e := range chain {
+		if err := ctx.Err(); err != nil {
+			return resp, err
+		}
+
+		attempt, results, err := e.attempt(ctx, query)
+		resp.Attempts = append(resp.Attempts, attempt)
+
+		switch attempt.Outcome {
+		case OutcomeOK:
+			resp.Results = results
+			resp.Engine = e.name
+			searchCache.put(key, resp)
+			return resp, nil
+		case OutcomeBlocked:
+			blocked = true
+		case OutcomeCooldown:
+			// Skipped for an earlier refusal: a block counts as one; a
+			// rejected API key or an exhausted quota is reported as itself.
+			if errors.Is(err, ErrBlocked) {
+				blocked = true
+			} else {
+				lastErr = err
+			}
+		case OutcomeNotParsed:
+			notParsed = true
+		case OutcomeNoTime:
+			lastErr = errTimeShort
+		case OutcomeError:
+			lastErr = err
 		}
 	}
 
-	return Response{}, err
-}
-
-func searchBing(ctx context.Context, query string) (Response, error) {
-	searchURL := SearchEndpoint + "?q=" + url.QueryEscape(query) + "&" + BingMarketParams
-
-	doc, err := fetchDocument(ctx, searchURL, "cookies.json")
-	if err != nil {
-		return Response{}, err
-	}
-
-	results := extractResults(doc)
-	if len(results) == 0 && !hasNoResultsMarker(doc) {
-		return Response{}, ErrResultsNotParsed
-	}
-
-	return Response{Query: query, Results: results}, nil
-}
-
-func searchDuckDuckGo(ctx context.Context, query string) (Response, error) {
-	searchURL := DuckDuckGoEndpoint + "/?q=" + url.QueryEscape(query) +
-		"&kl=" + DuckDuckGoRegion
-
-	doc, err := fetchDocument(ctx, searchURL, "cookies-ddg.json")
-	if err != nil {
-		return Response{}, err
-	}
-
-	if docHasDDGBlock(doc) {
-		return Response{}, ErrBlocked
-	}
-
-	results := extractDDGResults(doc)
-	if len(results) == 0 && !hasDDGNoResultsMarker(doc) {
-		return Response{}, ErrResultsNotParsed
-	}
-
-	return Response{Query: query, Results: results}, nil
-}
-
-// docHasDDGBlock reports whether the page is DuckDuckGo's anti-bot notice
-// rather than a results page.
-func docHasDDGBlock(doc *goquery.Document) bool {
-	text := strings.ToLower(doc.Find("body").Text())
-
-	return strings.Contains(text, "bots use duckduckgo") ||
-		strings.Contains(text, "unusual traffic")
-}
-
-// hasDDGNoResultsMarker reports whether the page carries DuckDuckGo's
-// standard "no results" notice, making an empty result set legitimate.
-func hasDDGNoResultsMarker(doc *goquery.Document) bool {
-	return doc.Find("div.no-results").Length() > 0
-}
-
-func extractDDGResults(doc *goquery.Document) []Result {
-	blocks := doc.Find("div.web-result")
-
-	var results []Result
-
-	blocks.EachWithBreak(func(i int, block *goquery.Selection) bool {
-		if i >= resultLimit {
-			return false
-		}
-
-		link := block.Find("a.result__a").First()
-		if link.Length() == 0 {
-			return true
-		}
-
-		title := strings.TrimSpace(link.Text())
-
-		href, ok := link.Attr("href")
-		if !ok {
-			return true
-		}
-
-		href = decodeDDGURL(href)
-		snippet := strings.TrimSpace(block.Find(".result__snippet").First().Text())
-
-		results = append(results, Result{
-			Rank:    i + 1,
-			Title:   title,
-			URL:     href,
-			Site:    getDomain(href),
-			Snippet: snippet,
-		})
-
-		return true
-	})
-
-	return results
-}
-
-// decodeDDGURL unwraps DuckDuckGo's //duckduckgo.com/l/?uddg=<escaped>
-// redirect links into their target URL; anything else passes through
-// unchanged.
-func decodeDDGURL(rawURL string) string {
-	u, err := url.Parse(rawURL)
-	if err != nil {
-		return rawURL
-	}
-
-	host := strings.ToLower(u.Hostname())
-	if !strings.Contains(host, "duckduckgo.com") || u.Path != "/l/" {
-		return rawURL
-	}
-
-	target := u.Query().Get("uddg")
-	if strings.HasPrefix(target, "http://") ||
-		strings.HasPrefix(target, "https:") {
-		return target
-	}
-
-	return rawURL
-}
-
-func extractResults(doc *goquery.Document) []Result {
-	blocks := doc.Find("li.b_algo")
-
-	var results []Result
-
-	blocks.EachWithBreak(func(i int, block *goquery.Selection) bool {
-		if i >= resultLimit {
-			return false
-		}
-
-		link := block.Find("h2 a").First()
-		if link.Length() == 0 {
-			return true
-		}
-
-		title := strings.TrimSpace(link.Text())
-
-		href, ok := link.Attr("href")
-		if !ok {
-			return true
-		}
-
-		href = decodeBingURL(href)
-		snippet := strings.TrimSpace(block.Find(".b_caption p").First().Text())
-
-		results = append(results, Result{
-			Rank:    i + 1,
-			Title:   title,
-			URL:     href,
-			Site:    getDomain(href),
-			Snippet: snippet,
-		})
-
-		return true
-	})
-
-	return results
-}
-
-var cookieMu sync.Mutex
-
-// fetchDocument holds cookieMu across the whole request on purpose: it both
-// guards the cookie files and deliberately serializes outbound searches,
-// lowering the chance of tripping the engines' anti-bot checks.
-func fetchDocument(ctx context.Context, searchURL, cookieFile string) (*goquery.Document, error) {
-	target, err := url.Parse(searchURL)
-	if err != nil {
-		return nil, err
-	}
-
-	jar, err := cookiejar.New(nil)
-	if err != nil {
-		return nil, err
-	}
-
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, searchURL, nil)
-	if err != nil {
-		return nil, err
-	}
-
-	req.Header.Set("User-Agent", userAgent)
-	req.Header.Set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
-	req.Header.Set("Accept-Language", "id-ID,id;q=0.9,en-US;q=0.8,en;q=0.7")
-
-	client := &http.Client{Timeout: 15 * time.Second, Jar: jar}
-
-	cookiePath, err := cookieFilePath(cookieFile)
-
-	cookieMu.Lock()
-	defer cookieMu.Unlock()
-
-	if err == nil {
-		loadCookies(cookiePath, target, jar)
-	}
-
-	resp, err := doWithRetry(client, req)
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("status %s", resp.Status)
-	}
-
-	doc, err := goquery.NewDocumentFromReader(resp.Body)
-	if err != nil {
-		return nil, err
-	}
-
-	if cookiePath != "" {
-		_ = saveCookies(cookiePath, target, jar)
-	}
-
-	if doc.Find("#turnstile-widget, .captcha_header").Length() > 0 {
-		return nil, ErrBlocked
-	}
-
-	return doc, nil
-}
-
-// hasNoResultsMarker reports whether the page carries Bing's standard
-// "no results" notice (li.b_no), which makes an empty result set legitimate.
-func hasNoResultsMarker(doc *goquery.Document) bool {
-	return doc.Find("li.b_no").Length() > 0
-}
-
-func cookieFilePath(name string) (string, error) {
-	dir, err := os.UserCacheDir()
-	if err != nil {
-		return "", err
-	}
-
-	dir = filepath.Join(dir, "websearch-tool")
-
-	if err := os.MkdirAll(dir, 0o755); err != nil {
-		return "", err
-	}
-
-	return filepath.Join(dir, name), nil
-}
-
-func loadCookies(path string, target *url.URL, jar *cookiejar.Jar) {
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return
-	}
-
-	var cookies []*http.Cookie
-	if err := json.Unmarshal(data, &cookies); err != nil {
-		return
-	}
-
-	jar.SetCookies(target, cookies)
-}
-
-func saveCookies(path string, target *url.URL, jar *cookiejar.Jar) error {
-	cookies := jar.Cookies(target)
-
-	data, err := json.MarshalIndent(cookies, "", "  ")
-	if err != nil {
-		return err
-	}
-
-	// 0600: the file holds session cookies; other users must not read it.
-	return os.WriteFile(path, data, 0o600)
-}
-
-func doWithRetry(client *http.Client, req *http.Request) (*http.Response, error) {
-	resp, err := client.Do(req)
-	if err == nil || req.Context().Err() != nil {
+	if err := ctx.Err(); err != nil {
 		return resp, err
 	}
 
-	select {
-	case <-time.After(500 * time.Millisecond):
-	case <-req.Context().Done():
-		return nil, req.Context().Err()
+	switch {
+	case blocked:
+		return resp, ErrBlocked
+	case notParsed:
+		return resp, ErrResultsNotParsed
+	default:
+		return resp, lastErr
 	}
-	return client.Do(req)
+}
+
+func activeEngines() []*engine {
+	seen := map[string]bool{}
+
+	var chain []*engine
+	for _, name := range Engines {
+		e, ok := engines[name]
+		if !ok || seen[name] {
+			continue
+		}
+		seen[name] = true
+
+		if e.enabled != nil && !e.enabled() {
+			continue
+		}
+		chain = append(chain, e)
+	}
+
+	return chain
+}
+
+// attempt asks one engine, after its gate lets the request through, and
+// judges the answer.
+func (e *engine) attempt(ctx context.Context, query string) (a Attempt, results []Result, err error) {
+	a.Engine = e.name
+	start := time.Now()
+	defer func() { a.DurationMS = time.Since(start).Milliseconds() }()
+
+	if err = e.gate.wait(ctx); err != nil {
+		var cooling *coolingDownError
+		switch {
+		case errors.As(err, &cooling):
+			a.Outcome = OutcomeCooldown
+			err = fmt.Errorf("%s: %w", e.name, err)
+		case errors.Is(err, errNoTimeLeft):
+			a.Outcome = OutcomeNoTime
+		default:
+			a.Outcome = OutcomeError
+		}
+		a.Error = err.Error()
+		return a, nil, err
+	}
+
+	attemptCtx, cancel := context.WithTimeout(ctx, AttemptTimeout)
+	results, err = e.search(attemptCtx, query)
+	cancel()
+
+	// An engine that ran out of its own AttemptTimeout while the caller's
+	// context is still alive must not read as the caller's deadline: an
+	// error wrapping context.DeadlineExceeded makes callers report that the
+	// whole search timed out.
+	if err != nil && ctx.Err() == nil && attemptCtx.Err() != nil && errors.Is(err, attemptCtx.Err()) {
+		err = fmt.Errorf("tidak menjawab dalam %v", AttemptTimeout)
+	}
+
+	var engErr *engineError
+	if errors.As(err, &engErr) && engErr.cooldown > 0 {
+		e.gate.coolDown(engErr.cooldown, err)
+	} else if errors.Is(err, ErrBlocked) {
+		e.gate.coolDown(e.cooldown, err)
+	}
+
+	switch {
+	case errors.Is(err, ErrBlocked):
+		a.Outcome = OutcomeBlocked
+	case errors.Is(err, ErrResultsNotParsed):
+		a.Outcome = OutcomeNotParsed
+	case err != nil:
+		a.Outcome = OutcomeError
+		err = fmt.Errorf("%s: %w", e.name, err)
+	case len(results) == 0:
+		a.Outcome = OutcomeEmpty
+		return a, nil, nil
+	default:
+		a.Results = len(results)
+
+		kept, related := filterRelevant(query, results, e.strict)
+		if !related {
+			a.Outcome = OutcomeUnrelated
+			return a, nil, nil
+		}
+
+		a.Outcome = OutcomeOK
+		a.Results = len(kept)
+		return a, kept, nil
+	}
+
+	a.Error = err.Error()
+	return a, nil, err
+}
+
+// resetState clears the cache and every engine's pacing and cool-down. Tests
+// use it; nothing else needs to.
+func resetState() {
+	searchCache.reset()
+	for _, e := range engines {
+		e.gate.reset()
+	}
+}
+
+func cleanText(s string) string {
+	return strings.Join(strings.Fields(s), " ")
 }
 
 func getDomain(rawURL string) string {
@@ -388,55 +354,5 @@ func getDomain(rawURL string) string {
 		return ""
 	}
 
-	host := u.Hostname()
-	host = strings.TrimPrefix(host, "www.")
-
-	return host
-}
-
-func decodeBingURL(rawURL string) string {
-	u, err := url.Parse(rawURL)
-	if err != nil {
-		return rawURL
-	}
-
-	if !strings.Contains(u.Host, "bing.com") ||
-		!strings.HasPrefix(u.Path, "/ck/a") {
-		return rawURL
-	}
-
-	encoded := u.Query().Get("u")
-	if encoded == "" {
-		return rawURL
-	}
-
-	if strings.HasPrefix(encoded, "a1") {
-		encoded = strings.TrimPrefix(encoded, "a1")
-	}
-
-	switch len(encoded) % 4 {
-	case 2:
-		encoded += "=="
-	case 3:
-		encoded += "="
-	}
-
-	decoded, err := base64.URLEncoding.DecodeString(encoded)
-	if err != nil {
-		decoded, err = base64.RawURLEncoding.DecodeString(
-			strings.TrimRight(encoded, "="),
-		)
-		if err != nil {
-			return rawURL
-		}
-	}
-
-	result := string(decoded)
-
-	if strings.HasPrefix(result, "http://") ||
-		strings.HasPrefix(result, "https://") {
-		return result
-	}
-
-	return rawURL
+	return strings.TrimPrefix(u.Hostname(), "www.")
 }
