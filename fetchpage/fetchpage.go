@@ -104,13 +104,52 @@ var httpClient = safeHTTPClient
 
 var safeDialer = &net.Dialer{Timeout: 10 * time.Second}
 
+// blockedNetworks are the special-purpose ranges the net.IP predicates
+// below do not cover. Carrier-grade NAT space is the one that matters most:
+// cloud providers put internal services there (Alibaba Cloud's metadata
+// endpoint is 100.100.100.200), and none of IsPrivate, IsLoopback or
+// IsLinkLocal recognises it. NAT64 is listed because 64:ff9b::a9fe:a9fe is
+// 169.254.169.254 to a host that translates it.
+var blockedNetworks = mustParseNetworks(
+	"0.0.0.0/8",      // "this network"
+	"100.64.0.0/10",  // carrier-grade NAT, cloud-internal services
+	"192.0.0.0/24",   // IETF protocol assignments
+	"198.18.0.0/15",  // benchmarking
+	"240.0.0.0/4",    // reserved, and the broadcast address
+	"64:ff9b::/96",   // NAT64 well-known prefix
+	"64:ff9b:1::/48", // NAT64 local-use prefix
+	"fec0::/10",      // deprecated site-local
+	"2001::/32",      // Teredo, which embeds an IPv4 address
+	"2002::/16",      // 6to4, which embeds an IPv4 address
+)
+
+func mustParseNetworks(cidrs ...string) []*net.IPNet {
+	networks := make([]*net.IPNet, 0, len(cidrs))
+	for _, cidr := range cidrs {
+		_, network, err := net.ParseCIDR(cidr)
+		if err != nil {
+			panic(err)
+		}
+		networks = append(networks, network)
+	}
+	return networks
+}
+
 func isBlockedIP(ip net.IP) bool {
-	return ip.IsLoopback() ||
+	if ip.IsLoopback() ||
 		ip.IsPrivate() ||
 		ip.IsLinkLocalUnicast() ||
 		ip.IsLinkLocalMulticast() ||
 		ip.IsUnspecified() ||
-		ip.IsMulticast()
+		ip.IsMulticast() {
+		return true
+	}
+	for _, network := range blockedNetworks {
+		if network.Contains(ip) {
+			return true
+		}
+	}
+	return false
 }
 
 func safeDialContext(ctx context.Context, network, addr string) (net.Conn, error) {

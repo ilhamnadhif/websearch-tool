@@ -36,6 +36,18 @@ func TestIsBlockedIP(t *testing.T) {
 		"0.0.0.0",
 		"224.0.0.1",
 		"ff02::1",
+		"100.64.0.1",      // carrier-grade NAT
+		"100.100.100.200", // Alibaba Cloud metadata
+		"0.1.2.3",
+		"192.0.0.170",
+		"198.18.0.1",
+		"240.0.0.1",
+		"255.255.255.255",
+		"64:ff9b::a9fe:a9fe", // NAT64 form of 169.254.169.254
+		"fec0::1",
+		"2001:0:4136:e378:8000:63bf:3fff:fdd2", // Teredo
+		"2002:a9fe:a9fe::1",                    // 6to4 of 169.254.169.254
+		"::ffff:10.0.0.1",                      // IPv4-mapped private
 	}
 
 	for _, s := range blocked {
@@ -53,7 +65,10 @@ func TestIsBlockedIP(t *testing.T) {
 		"1.1.1.1",
 		"142.250.4.113",
 		"2606:4700::1111",
-		"172.32.0.1", // just outside RFC1918 range
+		"172.32.0.1",     // just outside RFC1918 range
+		"100.63.255.255", // just below carrier-grade NAT
+		"100.128.0.1",    // just above it
+		"2001:4860:4860::8888",
 	}
 
 	for _, s := range allowed {
