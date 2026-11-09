@@ -218,6 +218,10 @@ internal/textmatch/             word matching shared by both
 - Some sites refuse every automated client, Cloudflare-protected ones in particular. They return `ErrBlocked`; read another source.
 - Only the first 40 pages of a PDF are read, and a scanned PDF without a text layer returns `ErrNoContent`.
 
+## Used by
+
+- [Bantuin AI](https://bantuinai.com), an Indonesian-language assistant on Telegram: its web search and page reading run on these two packages.
+
 ## License
 
 [MIT](LICENSE)
